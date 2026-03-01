@@ -1,0 +1,11 @@
+# ============================================
+# LLM / RAG
+# ============================================
+langchain
+langchain-ollama
+langchain-community
+langgraph
+pageindex
+openai
+openai-guardrails
+sentence-transformers

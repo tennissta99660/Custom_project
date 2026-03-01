@@ -1,0 +1,199 @@
+# Week 2 — Market Data Pipeline Implementation Plan
+
+Build the complete market data ingestion pipeline: Fyers API live ticks + yfinance fallback → Polars cleaning → ClickHouse bulk insert, orchestrated by Celery Beat + Prefect, with Redis caching and Postgres seeding.
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Fyers API Credentials**: The [.env](file:///e:/terminal_proj/.env) has empty `FYERS_APP_ID`, `FYERS_SECRET`, and `FYERS_ACCESS_TOKEN`. You'll need to register at [myapi.fyers.in](https://myapi.fyers.in) and fill these in. The auth module I'll build handles token refresh, but initial credentials must be set manually.
+
+> [!WARNING]
+> **Fyers API on Windows**: The Fyers OAuth2 flow requires a redirect URI. The auth script will spin up a local Flask server to capture the callback. You need to set `http://127.0.0.1:8765` as your redirect URL in the Fyers app dashboard.
+
+> [!NOTE]
+> **yfinance as primary for now**: Since Fyers credentials are empty, the pipeline will use yfinance as the primary data source out of the box. Fyers will activate automatically once credentials are configured. yfinance uses `.NS` suffix for NSE tickers (e.g., `RELIANCE.NS`).
+
+---
+
+## Proposed Changes
+
+### Config & Package Structure
+
+#### [MODIFY] [settings.py](file:///e:/terminal_proj/config/settings.py)
+- Add `FYERS_ACCESS_TOKEN`, `FYERS_REDIRECT_URI` fields
+- Add `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` fields
+- Add `MARKET_OPEN_HOUR`, `MARKET_CLOSE_HOUR` schedule constants
+
+#### [NEW] [\_\_init\_\_.py](file:///e:/terminal_proj/ingestion/__init__.py)
+#### [NEW] [\_\_init\_\_.py](file:///e:/terminal_proj/ingestion/market/__init__.py)
+#### [NEW] [\_\_init\_\_.py](file:///e:/terminal_proj/tasks/__init__.py)
+#### [NEW] [\_\_init\_\_.py](file:///e:/terminal_proj/flows/__init__.py)
+
+Empty init files to make packages importable.
+
+---
+
+### Fyers Authentication
+
+#### [NEW] [fyers_auth.py](file:///e:/terminal_proj/ingestion/market/fyers_auth.py)
+- `generate_auth_url()` → builds OAuth2 URL with app_id + redirect
+- `start_auth_server()` → Flask micro-server on port 8765 to capture auth code
+- `exchange_code_for_token(auth_code)` → POST to Fyers token endpoint
+- `get_or_refresh_token()` → checks if stored token is valid, refreshes if expired
+- Token persisted to `.fyers_token.json` (gitignored)
+
+---
+
+### Market Data Fetchers
+
+#### [MODIFY] [fyers_downloader.py](file:///e:/terminal_proj/ingestion/market/fyers_downloader.py)
+- `FyersDownloader` class
+- `fetch_quotes(symbols: list[str])` → live quote snapshot (LTP, volume, timestamp)
+- `fetch_historical(symbol, resolution, from_date, to_date)` → historical OHLCV
+- Returns `list[dict]` normalized to `{symbol, price, volume, timestamp}` format
+- Uses `fyers_apiv3.FyersModel` under the hood
+
+#### [MODIFY] [yfinance_downloader.py](file:///e:/terminal_proj/ingestion/market/yfinance_downloader.py)
+- `YFinanceDownloader` class
+- `fetch_quotes(symbols: list[str])` → current price via `yf.Ticker.fast_info`
+- `fetch_historical(symbol, period, interval)` → historical OHLCV via `yf.download()`
+- Returns same normalized format as Fyers for drop-in fallback
+- Handles `.NS` suffix mapping for NSE tickers
+
+---
+
+### Data Cleaning Pipeline
+
+#### [NEW] [polars_pipeline.py](file:///e:/terminal_proj/ingestion/market/polars_pipeline.py)
+- `clean_ticks(raw: list[dict]) → pl.DataFrame` 
+  - Cast types (symbol→Utf8, price→Float64, volume→Float64, timestamp→Datetime)
+  - Drop nulls, filter price > 0, dedup on (symbol, timestamp)
+  - Sort by (symbol, timestamp)
+- `df_to_clickhouse_rows(df: pl.DataFrame) → list[list]`
+  - Convert Polars DF to row-oriented format for ClickHouse insert
+
+---
+
+### Database Helpers
+
+#### [MODIFY] [clickhouse_client.py](file:///e:/terminal_proj/db/clickhouse_client.py)
+- `insert_ticks(rows: list[list])` → bulk insert into `market_ticks`
+- `get_latest_ticks(symbol, limit)` → query recent ticks
+- `get_ohlcv(symbol, timeframe, start, end)` → query OHLCV from MVs
+- `get_row_count(table)` → diagnostic helper
+
+#### [NEW] [redis_cache.py](file:///e:/terminal_proj/db/redis_cache.py)
+- `cache_latest_prices(prices: dict[str, float])` → SET each symbol with TTL 60s
+- `get_cached_price(symbol) → float | None` → GET with parse
+- `get_all_cached_prices() → dict` → SCAN for all cached prices
+- Key format: `price:{symbol}`
+
+---
+
+### Celery App & Tasks
+
+#### [NEW] [celery_app.py](file:///e:/terminal_proj/celery_app.py)
+- `app = Celery("atlas", broker=settings.CELERY_BROKER_URL)`
+- Beat schedule: `fetch-market-ticks` every 60s
+- Timezone: `Asia/Kolkata`
+
+#### [NEW] [market_tasks.py](file:///e:/terminal_proj/tasks/market_tasks.py)
+- `@app.task fetch_and_store_ticks()`
+  - Check if within market hours (9:15–15:30 IST)
+  - Try Fyers first, fallback to yfinance
+  - Clean via Polars pipeline
+  - Bulk insert into ClickHouse
+  - Cache latest prices in Redis
+  - Log count of inserted rows
+
+---
+
+### Prefect Orchestration
+
+#### [NEW] [market_flow.py](file:///e:/terminal_proj/flows/market_flow.py)
+- `@flow eod_data_pipeline()`
+  - Fetch full-day OHLCV for all NIFTY 50 symbols
+  - Clean + insert into ClickHouse
+  - Log summary stats
+- `@flow backfill_historical(days_back=30)`
+  - Fetch historical data for specified lookback
+  - Bulk insert into ClickHouse
+- Schedule: daily at 16:00 IST (after market close)
+
+---
+
+### Postgres Seeding
+
+#### [NEW] [seed_companies.py](file:///e:/terminal_proj/scripts/seed_companies.py)
+- Hardcoded NIFTY 50 ticker list with company names and CIK codes
+- Upsert into `companies` table (ON CONFLICT DO NOTHING)
+- Print summary of seeded records
+
+#### [NEW] [download_symbol_master.py](file:///e:/terminal_proj/scripts/download_symbol_master.py)
+- Download Fyers symbol master CSV from their API
+- Parse and store in a local `data/symbol_master.csv`
+- Create `fyers_symbols` table in Postgres if needed, or store as flat file
+
+---
+
+### Verification
+
+#### [NEW] [verify_market_data.py](file:///e:/terminal_proj/scripts/verify_market_data.py)
+- Check `market_ticks` row count
+- Check `ohlcv_1min` row count
+- Check `ohlcv_5min` row count
+- Check `companies` row count (should be 50)
+- Check Redis cached prices
+- Print formatted summary table
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+**1. Seed companies and verify Postgres:**
+```
+cd e:\terminal_proj
+python scripts/seed_companies.py
+python -c "from db.connections import Database; from sqlalchemy import text; r = Database.pg().connect().execute(text('SELECT count(*) FROM companies')); print(f'Companies: {r.scalar()}')"
+```
+Expected: `Companies: 50`
+
+**2. yfinance fetch + Polars pipeline + ClickHouse insert (end-to-end):**
+```
+cd e:\terminal_proj
+python -c "
+from ingestion.market.yfinance_downloader import YFinanceDownloader
+from ingestion.market.polars_pipeline import clean_ticks, df_to_clickhouse_rows
+from db.clickhouse_client import insert_ticks, get_row_count
+
+yd = YFinanceDownloader()
+raw = yd.fetch_quotes(['RELIANCE', 'TCS', 'INFY'])
+df = clean_ticks(raw)
+rows = df_to_clickhouse_rows(df)
+insert_ticks(rows)
+print(f'Ticks inserted. market_ticks count: {get_row_count(\"market_ticks\")}')
+"
+```
+
+**3. Full verification script:**
+```
+cd e:\terminal_proj
+python scripts/verify_market_data.py
+```
+
+### Manual Verification
+
+**4. Celery worker test** (requires Redis running):
+- Terminal 1: `celery -A celery_app worker --loglevel=info --pool=solo`
+- Terminal 2: `celery -A celery_app beat --loglevel=info`
+- Wait ~60s, then run: `python scripts/verify_market_data.py`
+- Confirm tick count increases
+
+**5. Prefect flow test:**
+```
+cd e:\terminal_proj
+python -c "from flows.market_flow import backfill_historical; backfill_historical(days_back=5)"
+python scripts/verify_market_data.py
+```

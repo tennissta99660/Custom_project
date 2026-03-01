@@ -1,0 +1,23 @@
+# ── Sensitive files ──
+.env
+
+# ── ClickHouse data (770MB+) ──
+clickhouse
+
+# ── Python cache ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS junk ──
+Thumbs.db
+.DS_Store

@@ -1,0 +1,20 @@
+# MARKET DATA
+yfinance
+fyers-apiv3
+
+# FILING & FUNDAMENTAL DATA
+edgartools
+arelle-release
+sec-api
+lxml
+httpx
+requests
+
+# AIS & GEOSPATIAL
+rasterio
+shapely
+pyproj
+sentinelsat
+websockets
+#
+dotenv

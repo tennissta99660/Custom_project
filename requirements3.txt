@@ -1,0 +1,16 @@
+# ML MODELS (PyTorch installed separately)
+# ============================================
+pytorch-lightning
+lightgbm
+optuna
+scikit-learn
+numpy
+pandas
+
+# BACKTESTING
+vectorbt
+
+# ONNX
+onnx
+onnxruntime
+skl2onnx

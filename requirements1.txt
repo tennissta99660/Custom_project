@@ -1,0 +1,42 @@
+# ============================================
+# CORE DATA & DATABASES
+# ============================================
+polars
+clickhouse-connect
+psycopg2-binary
+pgvector
+neo4j
+redis
+sqlalchemy
+
+
+
+#
+
+# ============================================
+# BACKEND
+# ============================================
+fastapi[standard]
+uvicorn[standard]
+pydantic
+celery[redis]
+fastapi-cache2
+slowapi
+
+# ============================================
+# MLOPS
+# ============================================
+mlflow
+prefect
+
+# ============================================
+# UTILS
+# ============================================
+python-dotenv
+tqdm
+rich
+loguru
+pytest
+black
+# 
+sqlalchemy
