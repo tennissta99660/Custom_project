@@ -16,3 +16,8 @@ onnxruntime
 skl2onnx
 #
 feedparser
+#
+smartapi-python
+#
+pyotp
+logzero

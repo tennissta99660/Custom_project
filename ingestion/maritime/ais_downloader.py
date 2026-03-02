@@ -11,11 +11,10 @@ Data flow:
                                      → Neo4j (:Vessel)-[:VISITED]->(:Port)
 
 Data Sources (free):
-  1. MarineTraffic (limited free API or web scraping)
-  2. AISHub (free community-shared AIS data)
-  3. USCG NAIS (US government AIS archive — historical)
-  4. Danish Maritime Authority (free historical AIS for research)
-  5. UN Global Platform AIS (for sanctioned vessel tracking)
+  1. NOAA Marine Cadastre (US Coast Guard AIS archive, 2009–2025) ← HISTORICAL
+  2. Marinesia API (real-time + 2026 data, free API key) ← REAL-TIME
+  3. Danish Maritime Authority (European waters, fallback)
+  4. UN Global Platform AIS (for sanctioned vessel tracking)
 
 Dark Ship Detection:
   A vessel is flagged as "dark" when:
@@ -94,15 +93,26 @@ VESSEL_TYPES = {
 class AISDownloader:
     """Downloads AIS ship tracking data from multiple free sources."""
 
-    # ── Danish Maritime Authority — free historical AIS ──
+    # ── NOAA Marine Cadastre — US Coast Guard AIS (2009–2025) ──
+    NOAA_BASE_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler"
+
+    # ── Marinesia API — real-time + 2026 data (free) ──
+    MARINESIA_URL = "https://api.marinesia.com/api/v2"
+
+    # ── Danish Maritime Authority — fallback (European waters) ──
     DMA_BASE_URL = "https://web.ais.dk/aisdata"
 
-    # ── AISHub API (community-shared AIS) ──
-    AISHUB_URL = "http://data.aishub.net/ws.php"
-
     def __init__(self):
-        self.client = httpx.Client(timeout=60.0, follow_redirects=True)
+        self.client = httpx.Client(timeout=120.0, follow_redirects=True)
+        self.marinesia_key = os.getenv("MARINESIA_API_KEY", "")
         logger.info("AISDownloader initialized")
+        if self.marinesia_key:
+            logger.info("Marinesia API key found — real-time data enabled")
+        else:
+            logger.warning(
+                "No MARINESIA_API_KEY in .env — register free at https://marinesia.com "
+                "to get real-time AIS data"
+            )
 
     def _haversine_km(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate distance between two coordinates in kilometers."""
@@ -118,19 +128,91 @@ class AISDownloader:
         )
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    def fetch_dma_historical(self, date: datetime) -> list[dict]:
+    def fetch_noaa_historical(self, date: datetime, max_rows: int = 100000) -> list[dict]:
         """
-        Fetch historical AIS data from the Danish Maritime Authority.
-        Free download — CSV files by date.
+        Fetch historical AIS data from NOAA Marine Cadastre (US Coast Guard).
+        Free download — daily CSV zip files, 2009–2025.
 
-        Note: Only covers vessels in Danish/European waters.
-        URL pattern: https://web.ais.dk/aisdata/aisdk-YYYY-MM-DD.zip
+        URL pattern: https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{date}.zip
+        NOAA CSV columns: MMSI, BaseDateTime, LAT, LON, SOG, COG, Heading,
+                          VesselName, IMO, VesselType, Status, Length, Width, Draft,
+                          Cargo, TransceiverClass
         """
+        date_str = date.strftime("%Y_%m_%d")
+        year = date.strftime("%Y")
+        url = f"{self.NOAA_BASE_URL}/{year}/AIS_{date_str}.zip"
+
+        try:
+            logger.info(f"Downloading NOAA AIS for {date.strftime('%Y-%m-%d')}...")
+            logger.info(f"URL: {url}")
+
+            # Stream download — files can be 300MB+
+            with self.client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                chunks = []
+                downloaded = 0
+                for chunk in resp.iter_bytes(chunk_size=8192 * 16):
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    if downloaded % (50 * 1024 * 1024) < 8192 * 16:
+                        logger.info(f"  Downloaded {downloaded // (1024*1024)}MB...")
+                data = b"".join(chunks)
+
+            logger.info(f"  Total download: {len(data) // (1024*1024)}MB — parsing CSV...")
+
+            import zipfile
+            positions = []
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for filename in zf.namelist():
+                    if filename.endswith(".csv"):
+                        with zf.open(filename) as f:
+                            reader = csv.DictReader(
+                                io.TextIOWrapper(f, encoding="utf-8", errors="replace")
+                            )
+                            row_count = 0
+                            for row in reader:
+                                try:
+                                    lat = float(row.get("LAT", 0) or 0)
+                                    lon = float(row.get("LON", 0) or 0)
+                                    if lat == 0 and lon == 0:
+                                        continue
+
+                                    positions.append({
+                                        "mmsi": row.get("MMSI", ""),
+                                        "imo": row.get("IMO", ""),
+                                        "ship_name": row.get("VesselName", ""),
+                                        "ship_type": int(row.get("VesselType", 0) or 0),
+                                        "lat": lat,
+                                        "lon": lon,
+                                        "speed": float(row.get("SOG", 0) or 0),
+                                        "heading": float(row.get("Heading", 0) or 0),
+                                        "course": float(row.get("COG", 0) or 0),
+                                        "nav_status": row.get("Status", ""),
+                                        "timestamp": row.get("BaseDateTime", ""),
+                                        "destination": "",
+                                        "draught": float(row.get("Draft", 0) or 0),
+                                    })
+                                    row_count += 1
+                                    if row_count >= max_rows:
+                                        logger.info(f"  Capped at {max_rows} rows (file has more)")
+                                        break
+                                except (ValueError, TypeError):
+                                    continue
+
+            logger.info(f"Parsed {len(positions)} AIS positions for {date.strftime('%Y-%m-%d')}")
+            return positions
+
+        except httpx.HTTPError as e:
+            logger.error(f"NOAA AIS fetch failed for {date.strftime('%Y-%m-%d')}: {e}")
+            return []
+
+    def fetch_dma_historical(self, date: datetime) -> list[dict]:
+        """Fallback: Fetch from Danish Maritime Authority (European waters only)."""
         date_str = date.strftime("%Y-%m-%d")
         url = f"{self.DMA_BASE_URL}/aisdk-{date_str}.zip"
 
         try:
-            logger.info(f"Downloading DMA AIS for {date_str}...")
+            logger.info(f"Trying DMA fallback for {date_str}...")
             resp = self.client.get(url)
             resp.raise_for_status()
 
@@ -149,14 +231,12 @@ class AISDownloader:
                                     lon = float(row.get("Longitude", 0))
                                     if lat == 0 and lon == 0:
                                         continue
-
                                     positions.append({
                                         "mmsi": row.get("MMSI", ""),
                                         "imo": row.get("IMO", ""),
                                         "ship_name": row.get("Name", ""),
                                         "ship_type": int(row.get("Ship type", 0) or 0),
-                                        "lat": lat,
-                                        "lon": lon,
+                                        "lat": lat, "lon": lon,
                                         "speed": float(row.get("SOG", 0) or 0),
                                         "heading": float(row.get("Heading", 0) or 0),
                                         "course": float(row.get("COG", 0) or 0),
@@ -167,13 +247,100 @@ class AISDownloader:
                                     })
                                 except (ValueError, TypeError):
                                     continue
-
-            logger.info(f"Parsed {len(positions)} AIS positions for {date_str}")
+            logger.info(f"DMA: Parsed {len(positions)} positions for {date_str}")
             return positions
-
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch DMA AIS for {date_str}: {e}")
+        except Exception as e:
+            logger.error(f"DMA fallback also failed: {e}")
             return []
+
+    def fetch_marinesia_realtime(self) -> list[dict]:
+        """
+        Fetch real-time AIS data from Marinesia API for all dark zones and key ports.
+        Uses the /api/v2/vessel/area endpoint with bounding boxes.
+
+        Free API key from https://marinesia.com
+        Returns current vessel positions in monitored maritime areas.
+        """
+        if not self.marinesia_key:
+            logger.warning("Marinesia API key not set — skipping real-time fetch")
+            return []
+
+        all_positions = []
+
+        # Query all dark zones
+        areas_to_query = {}
+        for name, zone in DARK_ZONES.items():
+            r = zone["radius_km"] / 111  # rough degrees
+            areas_to_query[name] = {
+                "lat_min": zone["lat"] - r,
+                "lat_max": zone["lat"] + r,
+                "long_min": zone["lon"] - r,
+                "long_max": zone["lon"] + r,
+            }
+
+        # Also query key ports
+        for name, port in KEY_PORTS.items():
+            r = port["radius_km"] / 111
+            areas_to_query[f"Port_{name}"] = {
+                "lat_min": port["lat"] - r,
+                "lat_max": port["lat"] + r,
+                "long_min": port["lon"] - r,
+                "long_max": port["lon"] + r,
+            }
+
+        for area_name, bbox in areas_to_query.items():
+            try:
+                resp = self.client.get(
+                    f"{self.MARINESIA_URL}/vessel/area",
+                    params={
+                        "lat_min": bbox["lat_min"],
+                        "lat_max": bbox["lat_max"],
+                        "long_min": bbox["long_min"],
+                        "long_max": bbox["long_max"],
+                        "key": self.marinesia_key,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                if not data.get("error") and data.get("data"):
+                    for v in data["data"]:
+                        all_positions.append({
+                            "mmsi": str(v.get("mmsi", "")),
+                            "imo": str(v.get("imo", "")),
+                            "ship_name": v.get("name", ""),
+                            "ship_type": 0,  # Marinesia uses text type
+                            "ship_type_text": v.get("type", ""),
+                            "lat": v.get("lat", 0),
+                            "lon": v.get("lng", 0),
+                            "speed": v.get("sog", 0),
+                            "heading": v.get("hdt", 0),
+                            "course": v.get("cog", 0),
+                            "nav_status": str(v.get("status", "")),
+                            "timestamp": v.get("ts", ""),
+                            "destination": v.get("dest", ""),
+                            "draught": 0,
+                            "source": "marinesia",
+                            "area": area_name,
+                            "flag": v.get("flag", ""),
+                        })
+                    logger.info(f"  {area_name}: {len(data['data'])} vessels")
+                else:
+                    logger.debug(f"  {area_name}: no vessels found")
+
+                time.sleep(0.3)  # Rate limit
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.warning(f"Rate limited on {area_name} — pausing 5s")
+                    time.sleep(5)
+                else:
+                    logger.debug(f"  {area_name}: {e}")
+            except Exception as e:
+                logger.debug(f"  {area_name}: {e}")
+
+        logger.info(f"Marinesia: fetched {len(all_positions)} vessel positions across {len(areas_to_query)} areas")
+        return all_positions
 
     def detect_dark_ships(self, positions: list[dict], gap_hours: float = 4.0) -> list[dict]:
         """
@@ -446,12 +613,21 @@ class AISDownloader:
         logger.info("AIS Downloader — Starting")
         logger.info("━" * 50)
 
-        date = date or (datetime.now(timezone.utc) - timedelta(days=1))
+        # NOAA data typically available 2009–2025 (not yet published for 2026)
+        if date is None:
+            date = datetime(2025, 1, 15, tzinfo=timezone.utc)
+            logger.info("No date specified — using 2025-01-15 (latest available NOAA data)")
 
-        # 1. Fetch AIS positions
-        positions = self.fetch_dma_historical(date)
+        # 1. Fetch AIS positions — try NOAA first, then DMA fallback
+        positions = self.fetch_noaa_historical(date)
         if not positions:
-            logger.warning("No AIS data fetched — this source may only cover Danish/European waters")
+            logger.warning("NOAA failed — trying DMA fallback...")
+            positions = self.fetch_dma_historical(date)
+        if not positions:
+            logger.warning("Historical sources failed — trying Marinesia real-time...")
+            positions = self.fetch_marinesia_realtime()
+        if not positions:
+            logger.error("No AIS data fetched from any source")
             return
 
         # 2. Detect dark ships
@@ -516,10 +692,19 @@ if __name__ == "__main__":
     downloader = AISDownloader()
     try:
         args = sys.argv[1:]
+
+        # Parse --date YYYY-MM-DD
+        target_date = None
+        if "--date" in args:
+            idx = args.index("--date")
+            if len(args) > idx + 1:
+                target_date = datetime.strptime(args[idx + 1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
         if "--backfill" in args:
-            days = int(args[args.index("--backfill") + 1]) if len(args) > args.index("--backfill") + 1 else 30
+            idx = args.index("--backfill")
+            days = int(args[idx + 1]) if len(args) > idx + 1 else 30
             downloader.run_backfill(days_back=days)
         else:
-            downloader.run()
+            downloader.run(date=target_date)
     finally:
         downloader.close()
