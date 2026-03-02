@@ -17,7 +17,8 @@ import sys
 import io
 import zipfile
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import time
 from typing import Optional
 
 import httpx
@@ -281,8 +282,101 @@ class GDELTDownloader:
         except Exception as e:
             logger.error(f"ClickHouse insert failed: {e}")
 
+    def fetch_historical_day(self, date: datetime) -> list[dict]:
+        """
+        Fetch one GDELT batch for a specific date from the archive.
+        Uses the noon (120000) batch for each day.
+
+        GDELT v2 archive URL pattern:
+          http://data.gdeltproject.org/gdeltv2/YYYYMMDDHHMMSS.export.CSV.zip
+        """
+        date_str = date.strftime("%Y%m%d")
+        url = f"http://data.gdeltproject.org/gdeltv2/{date_str}120000.export.CSV.zip"
+
+        events = self._download_and_extract_csv(url)
+        if not events:
+            # Try midnight batch as fallback
+            url = f"http://data.gdeltproject.org/gdeltv2/{date_str}000000.export.CSV.zip"
+            events = self._download_and_extract_csv(url)
+
+        return events
+
+    def run_backfill(self, years_back: int = 10, sample_interval_days: int = 1):
+        """
+        Historical backfill: fetch one GDELT batch per day going back N years.
+
+        GDELT v2 archives start from Feb 2015. For older data, only v1 is available.
+
+        Args:
+            years_back: Number of years to go back (max ~10 for GDELT v2).
+            sample_interval_days: Fetch one batch every N days (1 = daily, 7 = weekly).
+                                  Higher = faster backfill but less data.
+        """
+        logger.info("━" * 50)
+        logger.info(f"GDELT Historical Backfill — {years_back} years")
+        logger.info("━" * 50)
+
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=years_back * 365)
+
+        # GDELT v2 started Feb 18, 2015
+        gdelt_v2_start = datetime(2015, 2, 18, tzinfo=timezone.utc)
+        if start_date < gdelt_v2_start:
+            start_date = gdelt_v2_start
+            logger.warning(f"GDELT v2 starts at {gdelt_v2_start.date()}, adjusted start date")
+
+        # Calculate total days
+        total_days = (end_date - start_date).days
+        fetch_count = total_days // sample_interval_days
+        logger.info(f"Date range: {start_date.date()} → {end_date.date()}")
+        logger.info(f"Fetching ~{fetch_count} daily batches (every {sample_interval_days} day(s))")
+        logger.info(f"Estimated events: ~{fetch_count * 2000:,} (avg ~2000 events per batch)")
+
+        total_events = 0
+        total_inserted = 0
+        errors = 0
+        current_date = start_date
+        batch_num = 0
+
+        while current_date < end_date:
+            batch_num += 1
+
+            try:
+                events = self.fetch_historical_day(current_date)
+
+                if events:
+                    self.insert_to_postgres(events)
+                    self.insert_to_clickhouse(events)
+                    # Skip Neo4j for backfill — too slow for millions of events
+                    total_events += len(events)
+                    total_inserted += 1
+
+                    if batch_num % 30 == 0:  # Progress every 30 batches
+                        logger.info(
+                            f"  Progress: {batch_num}/{fetch_count} batches | "
+                            f"{current_date.date()} | "
+                            f"{total_events:,} events total"
+                        )
+                else:
+                    errors += 1
+
+            except Exception as e:
+                errors += 1
+                logger.debug(f"Failed for {current_date.date()}: {e}")
+
+            # Rate limit: be nice to GDELT servers
+            time.sleep(0.5)
+            current_date += timedelta(days=sample_interval_days)
+
+        logger.info("━" * 50)
+        logger.info(f"GDELT Backfill Complete ✓")
+        logger.info(f"  Batches fetched: {total_inserted}/{batch_num}")
+        logger.info(f"  Total events: {total_events:,}")
+        logger.info(f"  Errors/skips: {errors}")
+        logger.info("━" * 50)
+
     def run(self):
-        """Full pipeline: fetch latest GDELT → insert PG + ClickHouse."""
+        """Full pipeline: fetch latest GDELT → insert PG + ClickHouse + Neo4j."""
         logger.info("━" * 50)
         logger.info("GDELT Downloader — Starting")
         logger.info("━" * 50)
@@ -395,6 +489,13 @@ class GDELTDownloader:
 if __name__ == "__main__":
     downloader = GDELTDownloader()
     try:
-        downloader.run()
+        args = sys.argv[1:]
+        if "--backfill" in args:
+            # Usage: python gdelt_downloader.py --backfill [years] [interval_days]
+            years = int(args[args.index("--backfill") + 1]) if len(args) > args.index("--backfill") + 1 else 10
+            interval = int(args[args.index("--backfill") + 2]) if len(args) > args.index("--backfill") + 2 else 1
+            downloader.run_backfill(years_back=years, sample_interval_days=interval)
+        else:
+            downloader.run()
     finally:
         downloader.close()

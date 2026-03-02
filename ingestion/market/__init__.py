@@ -1,6 +1,6 @@
-# Market data ingestion — Fyers + Yahoo Finance downloaders
+# Market data ingestion — Angel One SmartAPI + Yahoo Finance downloaders
 
-from ingestion.market.fyers_downloader import FyersDownloader
+from ingestion.market.angel_one_downloader import AngelOneDownloader
 from ingestion.market.yfinance_downloader import YFinanceDownloader
 
-__all__ = ["FyersDownloader", "YFinanceDownloader"]
+__all__ = ["AngelOneDownloader", "YFinanceDownloader"]

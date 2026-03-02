@@ -14,3 +14,5 @@ vectorbt
 onnx
 onnxruntime
 skl2onnx
+#
+feedparser

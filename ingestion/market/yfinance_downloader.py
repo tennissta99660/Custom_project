@@ -52,7 +52,7 @@ class YFinanceDownloader:
     def fetch_history(
         self,
         ticker: str,
-        period: str = "1mo",
+        period: str = "10y",
         interval: str = "1d",
     ) -> list[dict]:
         """
@@ -232,7 +232,7 @@ class YFinanceDownloader:
         self,
         tickers: list[str] = None,
         categories: list[str] = None,
-        period: str = "1mo",
+        period: str = "10y",
         interval: str = "1d",
         fetch_info: bool = True,
     ):

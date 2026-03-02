@@ -1,2 +1,1 @@
-# Atlas Search Engine — Data Ingestion Pipeline
-# Subpackages: filings, market, news
+# Ingestion pipeline — news, market, filings, maritime

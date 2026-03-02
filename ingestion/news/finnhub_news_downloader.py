@@ -38,7 +38,7 @@ class FinnhubNewsDownloader:
         )
         logger.info("FinnhubNewsDownloader initialized")
 
-    def fetch_company_news(self, ticker: str, days_back: int = 7) -> list[dict]:
+    def fetch_company_news(self, ticker: str, days_back: int = 365) -> list[dict]:
         """Fetch news for a specific company ticker."""
         end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         start = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")

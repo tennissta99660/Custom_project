@@ -90,7 +90,7 @@ class EDGARDownloader:
             logger.error(f"Failed to fetch submissions for CIK {cik}: {e}")
             return None
 
-    def get_recent_filings(self, cik: str, form_types: list[str] = None, limit: int = 20) -> list[dict]:
+    def get_recent_filings(self, cik: str, form_types: list[str] = None, limit: int = 200) -> list[dict]:
         """
         Get recent filings for a company, filtered by form type.
 
@@ -159,7 +159,7 @@ class EDGARDownloader:
             logger.error(f"Failed to download filing from {url}: {e}")
             return None
 
-    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> list[str]:
         """Split text into overlapping chunks for embedding storage."""
         chunks = []
         start = 0
@@ -326,7 +326,7 @@ class EDGARDownloader:
 
         all_filings = []
         for cik in ciks:
-            filings = self.get_recent_filings(cik, form_types=form_types, limit=5)
+            filings = self.get_recent_filings(cik, form_types=form_types, limit=50)
             all_filings.extend(filings)
 
         logger.info(f"Total filings to process: {len(all_filings)}")
