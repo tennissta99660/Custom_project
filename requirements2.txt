@@ -18,3 +18,5 @@ sentinelsat
 websockets
 #
 dotenv
+#
+pgvector
